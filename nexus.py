@@ -383,18 +383,28 @@ def update_market_regime():
     """Detect market regime from SPY technical structure"""
     try:
         df = get_bars("SPY", "1Day", 220)
-        if df is None:
+
+        # ── FIX: guard against None or insufficient data ──────────────────────
+        if df is None or len(df) < 20:
+            log.warning("Regime detection skipped: insufficient SPY data")
             return
 
         df  = compute_indicators(df)
         row = df.iloc[-1]
         price = float(row["close"])
 
-        above_50   = not pd.isna(row["sma_50"])  and price > float(row["sma_50"])
-        above_200  = not pd.isna(row["sma_200"]) and price > float(row["sma_200"])
-        rsi        = float(row["rsi"])    if not pd.isna(row["rsi"])    else 50
-        chg_20d    = float(row["chg_20d"]) if not pd.isna(row["chg_20d"]) else 0
-        macd_bull  = float(row["macd"])   > 0 if not pd.isna(row["macd"]) else False
+        # ── FIX: use .get() with NaN fallbacks instead of direct key access ───
+        sma_50  = row.get("sma_50",  float("nan"))
+        sma_200 = row.get("sma_200", float("nan"))
+        macd    = row.get("macd",    float("nan"))
+        rsi_val = row.get("rsi",     float("nan"))
+        chg_20d_val = row.get("chg_20d", float("nan"))
+
+        above_50  = not pd.isna(sma_50)  and price > float(sma_50)
+        above_200 = not pd.isna(sma_200) and price > float(sma_200)
+        rsi       = float(rsi_val)    if not pd.isna(rsi_val)    else 50
+        chg_20d   = float(chg_20d_val) if not pd.isna(chg_20d_val) else 0
+        macd_bull = float(macd) > 0   if not pd.isna(macd)       else False
 
         if above_50 and above_200 and chg_20d > 1 and macd_bull:
             regime = "bull"
@@ -420,6 +430,8 @@ def update_market_regime():
         if old != regime:
             log.info(f"🌍 Regime: {old} → {regime.upper()} | SPY RSI:{rsi:.1f} 20d:{chg_20d:+.1f}% | New threshold:{state['conf_threshold']}%")
             telegram(f"🌍 Market regime: {old} → {regime.upper()}\nSPY RSI:{rsi:.1f} | 20D:{chg_20d:+.1f}%\nNew conf threshold: {state['conf_threshold']}%")
+        else:
+            log.info(f"Regime: {regime.upper()} | SPY RSI:{rsi:.1f} 20d:{chg_20d:+.1f}%")
 
     except Exception as e:
         log.error(f"Regime detection failed: {e}")
