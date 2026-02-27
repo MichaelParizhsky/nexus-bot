@@ -55,6 +55,7 @@ state = {
     "pending_evals": [],   # trades waiting for outcome check
     "conf_threshold": CONF_THRESH,
     "trade_history": [],
+    "last_eod_date": None,
 }
 
 STATE_FILE = "nexus_state.json"
@@ -584,6 +585,158 @@ def send_status_report():
     except Exception as e:
         log.error(f"Status report failed: {e}")
 
+# ─── POST-MARKET LEARNING ─────────────────────────────────────────────────────
+def post_market_analysis():
+    """Run once after market close — review the day, adapt weights/strategies for tomorrow."""
+    today_str = datetime.now(EST).date().isoformat()
+    log.info("═" * 55)
+    log.info(f"  📚 EOD LEARNING SESSION — {today_str}")
+    log.info("═" * 55)
+
+    # ── Gather context ──
+    today_trades = [t for t in state["trade_history"] if t.get("time", "").startswith(today_str)]
+    recent_trades = state["trade_history"][-30:]  # up to 30 trades for multi-day patterns
+
+    total = state["wins"] + state["losses"]
+    wr = state["wins"] / total * 100 if total > 0 else 0
+
+    strat_perf = [
+        {
+            "id": s["id"], "name": s["name"],
+            "wins": s["wins"], "losses": s["losses"],
+            "wr": round(s["wins"] / (s["wins"] + s["losses"]) * 100, 1)
+                  if s["wins"] + s["losses"] > 0 else None
+        }
+        for s in state["strategies"]
+    ]
+
+    context = {
+        "date": today_str,
+        "today_trades": today_trades,
+        "recent_trades_30": recent_trades,
+        "overall_wins": state["wins"],
+        "overall_losses": state["losses"],
+        "overall_wr_pct": round(wr, 1),
+        "streak": state["streak"],
+        "agent_weights": state["agent_weights"],
+        "conf_threshold": state["conf_threshold"],
+        "active_strategy": state.get("active_strategy", {}).get("name"),
+        "strategy_performance": strat_perf,
+        "watchlist": WATCHLIST,
+    }
+
+    log.info(f"  Today: {len(today_trades)} trades | Overall: {state['wins']}W/{state['losses']}L ({wr:.1f}%)")
+
+    if not client:
+        log.info("  No Anthropic client — skipping AI analysis, saving date")
+        state["last_eod_date"] = today_str
+        save_state()
+        telegram(f"📚 EOD: Market closed for {today_str}\nNo AI analysis (missing key)\nOverall WR: {wr:.1f}%")
+        return
+
+    try:
+        prompt = f"""You are NEXUS learning engine performing end-of-day analysis.
+
+TRADING DATA:
+{json.dumps(context, indent=2, default=str)}
+
+Analyze the trading patterns across today and recent history. Identify:
+- Which agents were most/least accurate (cross-reference agent_weights drift with outcomes)
+- Which strategies had the best win rates
+- What market conditions drove today's results
+- What adjustments will improve performance tomorrow
+
+Return ONLY valid JSON (no markdown, no explanation):
+{{
+  "weight_adjustments": {{"sentinel": 0.0, "oracle": 0.0, "arbiter": 0.0, "cassandra": 0.0, "herald": 0.0, "guardian": 0.0}},
+  "confidence_adjustment": 0,
+  "best_strategy_id": null,
+  "new_strategy": null,
+  "market_insight": "one sentence on today's market",
+  "tomorrow_outlook": "one sentence on what to watch tomorrow",
+  "summary": "2-3 sentence learning summary"
+}}
+
+Rules:
+- weight_adjustments: small deltas only (-0.15 to +0.15 per agent)
+- confidence_adjustment: integer, -5 to +5
+- best_strategy_id: must match an id in strategy_performance, or null
+- new_strategy: {{"id":"unique_snake_case","name":"Name","description":"Entry/exit rules in one sentence"}} or null"""
+
+        resp = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=600,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = resp.content[0].text.strip().replace("```json", "").replace("```", "")
+        analysis = json.loads(raw)
+
+        # ── Apply weight adjustments ──
+        weight_log = []
+        for agent, delta in analysis.get("weight_adjustments", {}).items():
+            if agent in state["agent_weights"] and delta != 0:
+                old_w = state["agent_weights"][agent]
+                new_w = round(max(0.3, min(2.5, old_w + delta)), 3)
+                state["agent_weights"][agent] = new_w
+                weight_log.append(f"{agent}: {old_w:.2f}→{new_w:.2f}")
+        if weight_log:
+            log.info(f"  Weights adjusted: {', '.join(weight_log)}")
+
+        # ── Apply confidence threshold adjustment ──
+        conf_adj = int(analysis.get("confidence_adjustment", 0))
+        if conf_adj:
+            old_thresh = state["conf_threshold"]
+            state["conf_threshold"] = max(50, min(90, old_thresh + conf_adj))
+            log.info(f"  Confidence threshold: {old_thresh}% → {state['conf_threshold']}%")
+
+        # ── Switch to best strategy ──
+        best_id = analysis.get("best_strategy_id")
+        if best_id:
+            best = next((s for s in state["strategies"] if s["id"] == best_id), None)
+            if best:
+                state["active_strategy"] = best
+                log.info(f"  Tomorrow's strategy: {best['name']}")
+
+        # ── Add newly discovered strategy ──
+        new_strat = analysis.get("new_strategy")
+        if new_strat and isinstance(new_strat, dict) and new_strat.get("id"):
+            if not any(s["id"] == new_strat["id"] for s in state["strategies"]):
+                state["strategies"].append({**new_strat, "wins": 0, "losses": 0, "source": "eod-learning"})
+                log.info(f"  New strategy added: {new_strat['name']}")
+
+        state["last_eod_date"] = today_str
+        save_state()
+
+        # ── Telegram EOD report ──
+        wt_str = "\n".join([f"  {l}" for l in weight_log]) if weight_log else "  No changes"
+        report = (
+            f"📚 END OF DAY REPORT — {today_str}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Today's trades: {len(today_trades)}\n"
+            f"Overall W/L: {state['wins']}/{state['losses']} ({wr:.1f}% WR)\n"
+            f"Streak: {state['streak']:+d}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🧠 Today: {analysis.get('market_insight', '—')}\n"
+            f"🔭 Tomorrow: {analysis.get('tomorrow_outlook', '—')}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Agent weight changes:\n{wt_str}\n"
+            f"Threshold: {state['conf_threshold']}%\n"
+            f"Strategy: {state.get('active_strategy', {}).get('name', '—')}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{analysis.get('summary', '')}"
+        )
+        telegram(report)
+        log.info(f"  📚 Learning complete. Summary: {analysis.get('summary', '')}")
+
+    except Exception as e:
+        log.error(f"Post-market analysis failed: {e}")
+        state["last_eod_date"] = today_str
+        save_state()
+        telegram(f"📚 EOD {today_str}: Analysis error ({e})\nOverall WR: {wr:.1f}% | W:{state['wins']} L:{state['losses']}")
+
+    log.info("═" * 55)
+
+
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 def main():
     log.info("═" * 55)
@@ -616,6 +769,7 @@ def main():
 
     status_counter = 0
     last_scan = 0
+    market_was_open = False
 
     log.info(f"\nWatchlist: {', '.join(WATCHLIST)}")
     log.info(f"Interval:  {INTERVAL_MIN} min")
@@ -631,6 +785,7 @@ def main():
             check_stops()
 
             if is_market_open():
+                market_was_open = True
                 # Run full scan every INTERVAL_MIN minutes
                 if now - last_scan >= INTERVAL_MIN * 60:
                     last_scan = now
@@ -658,8 +813,13 @@ def main():
                         search_strategies()
 
             else:
-                # Outside market hours — log once per hour
-                if now - last_scan >= 3600:
+                # Outside market hours
+                today_str = datetime.now(EST).date().isoformat()
+                if market_was_open and state.get("last_eod_date") != today_str:
+                    # Market just closed — run EOD learning session
+                    post_market_analysis()
+                    market_was_open = False
+                elif not market_was_open and now - last_scan >= 3600:
                     last_scan = now
                     log.info(f"Market closed ({market_open_time()}) — waiting for open (9:30AM EST)")
 
