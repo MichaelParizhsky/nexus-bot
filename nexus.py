@@ -402,18 +402,54 @@ def get_bars_sip(symbol, timeframe="1Day", limit=100):
         log.warning(f"SIP bars fetch failed {symbol}: {e}")
         return None
 
+def get_spy_regime_from_snapshot():
+    """Lightweight regime detection using SPY snapshot when bar feeds fail"""
+    try:
+        snap = get_snapshots(["SPY"]).get("SPY", {})
+        price = snap.get("latestTrade", {}).get("p")
+        prev  = snap.get("prevDailyBar", {})
+        curr  = snap.get("dailyBar", {})
+        if not price or not prev or not curr:
+            return None
+        prev_close = prev.get("c", price)
+        chg_1d = (float(price) - float(prev_close)) / float(prev_close) * 100
+        # Simple heuristic: use 1-day change as proxy when we lack history
+        if chg_1d > 0.5:
+            return "bull"
+        elif chg_1d < -0.5:
+            return "bear"
+        else:
+            return "neutral"
+    except Exception as e:
+        log.warning(f"SPY snapshot regime fallback failed: {e}")
+        return None
+
 def update_market_regime():
     """Detect market regime from SPY technical structure"""
     try:
         df = get_bars("SPY", "1Day", 220)
 
-        # ── FIX: fallback to SIP feed if IEX returns insufficient data ────────
+        # ── Fallback chain: IEX bars → SIP bars → snapshot heuristic ─────────
         if df is None or len(df) < 20:
             log.warning("IEX feed insufficient for SPY — trying SIP feed fallback")
             df = get_bars_sip("SPY", "1Day", 220)
 
         if df is None or len(df) < 20:
-            log.warning("Regime detection skipped: insufficient SPY data on both feeds")
+            log.warning("SIP feed also insufficient — using snapshot heuristic")
+            regime = get_spy_regime_from_snapshot()
+            if regime:
+                old = state["market_regime"]
+                state["market_regime"] = regime
+                state["conf_threshold"] = (
+                    min(85, CONF_THRESH + 10) if regime == "bear"
+                    else max(55, CONF_THRESH - 5) if regime == "bull"
+                    else CONF_THRESH
+                )
+                log.info(f"Regime (snapshot): {regime.upper()} | Threshold: {state['conf_threshold']}%")
+                if old != regime:
+                    telegram(f"🌍 Market regime: {old} → {regime.upper()} (snapshot)\nNew threshold: {state['conf_threshold']}%")
+            else:
+                log.warning("Regime detection skipped: all data sources failed")
             return
 
         df  = compute_indicators(df)
