@@ -379,14 +379,41 @@ def format_indicators(symbol, df, price, news=None, hourly_df=None):
     )
 
 # ─── MARKET REGIME DETECTION ─────────────────────────────────────────────────
+def get_bars_sip(symbol, timeframe="1Day", limit=100):
+    """Fetch OHLCV bars using SIP feed as fallback"""
+    try:
+        data = alpaca_data(f"/v2/stocks/{symbol}/bars", params={
+            "timeframe": timeframe, "limit": limit,
+            "adjustment": "raw", "feed": "sip"
+        })
+        bars = data.get("bars", [])
+        if not bars:
+            return None
+        df = pd.DataFrame(bars)
+        df["t"] = pd.to_datetime(df["t"])
+        df.set_index("t", inplace=True)
+        df.rename(columns={"o":"open","h":"high","l":"low","c":"close",
+                            "v":"volume","vw":"vwap_bar","n":"trades"}, inplace=True)
+        for col in ["open","high","low","close","volume"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
+    except Exception as e:
+        log.warning(f"SIP bars fetch failed {symbol}: {e}")
+        return None
+
 def update_market_regime():
     """Detect market regime from SPY technical structure"""
     try:
         df = get_bars("SPY", "1Day", 220)
 
-        # ── FIX: guard against None or insufficient data ──────────────────────
+        # ── FIX: fallback to SIP feed if IEX returns insufficient data ────────
         if df is None or len(df) < 20:
-            log.warning("Regime detection skipped: insufficient SPY data")
+            log.warning("IEX feed insufficient for SPY — trying SIP feed fallback")
+            df = get_bars_sip("SPY", "1Day", 220)
+
+        if df is None or len(df) < 20:
+            log.warning("Regime detection skipped: insufficient SPY data on both feeds")
             return
 
         df  = compute_indicators(df)
