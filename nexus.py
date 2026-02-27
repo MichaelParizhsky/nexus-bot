@@ -1237,6 +1237,174 @@ def send_status_report():
     except Exception as e:
         log.error(f"Status report failed: {e}")
 
+# ─── AFTER-HOURS LEARNING ────────────────────────────────────────────────────
+def after_hours_learning():
+    """
+    Runs overnight to keep the bot learning even when the market is closed.
+    1. Scores indicator predictiveness from recent bar history
+    2. Asks Claude to reflect on trade history and adjust weights
+    3. Searches for new watchlist candidates
+    4. Reviews and rotates strategy if a better one has emerged
+    """
+    log.info("🌙 After-hours learning session starting...")
+    telegram("🌙 After-hours learning started")
+    learned_anything = False
+
+    # ── 1. Indicator backscore ─────────────────────────────────────────────
+    log.info("📊 Scoring indicator predictiveness from recent history...")
+    indicator_hits   = {k: 0 for k in state["indicator_scores"]}
+    indicator_trials = {k: 0 for k in state["indicator_scores"]}
+
+    for sym in WATCHLIST:
+        try:
+            df = get_bars(sym, "1Day", 60)
+            if df is None or len(df) < 30:
+                df = get_bars_sip(sym, "1Day", 60)
+            if df is None or len(df) < 30:
+                continue
+            df = compute_indicators(df)
+            for i in range(20, len(df) - 1):
+                row      = df.iloc[i]
+                next_ret = (float(df.iloc[i+1]["close"]) - float(row["close"])) / float(row["close"])
+                won      = next_ret > 0.002
+                snap     = snapshot_indicators(row.to_dict())
+                for ind, was_active in snap.items():
+                    if was_active:
+                        indicator_trials[ind] += 1
+                        if won:
+                            indicator_hits[ind] += 1
+            learned_anything = True
+        except Exception as e:
+            log.warning(f"Indicator backscore failed {sym}: {e}")
+
+    for ind in indicator_hits:
+        trials = indicator_trials[ind]
+        if trials >= 5:
+            hit_rate = indicator_hits[ind] / trials
+            adj = 1 if hit_rate > 0.55 else (-1 if hit_rate < 0.45 else 0)
+            state["indicator_scores"][ind] = state["indicator_scores"].get(ind, 0) + adj
+            if adj != 0:
+                log.info(f"  {ind}: hit_rate={hit_rate:.0%} ({trials} trials) → score adj {adj:+d}")
+
+    # ── 2. Claude trade history reflection ────────────────────────────────
+    if client and len(state["trade_history"]) >= 3:
+        log.info("🤖 Asking Claude to reflect on trade history...")
+        try:
+            history_summary = json.dumps(state["trade_history"][-20:], indent=2)
+            agent_weights   = json.dumps(state["agent_weights"], indent=2)
+            ind_scores      = json.dumps(
+                sorted(state["indicator_scores"].items(), key=lambda x: x[1], reverse=True), indent=2)
+            strat_perf = json.dumps(
+                [{"name": s["name"], "wins": s["wins"], "losses": s["losses"]}
+                 for s in state["strategies"] if s["wins"] + s["losses"] > 0], indent=2)
+
+            resp = client.messages.create(
+                model=MODEL_OVERSEER, max_tokens=800,
+                messages=[{"role": "user", "content":
+                    f"You are NEXUS, an autonomous trading bot doing overnight self-reflection.\n\n"
+                    f"RECENT TRADE HISTORY (last 20):\n{history_summary}\n\n"
+                    f"CURRENT AGENT WEIGHTS:\n{agent_weights}\n\n"
+                    f"INDICATOR SCORES:\n{ind_scores}\n\n"
+                    f"STRATEGY PERFORMANCE:\n{strat_perf}\n\n"
+                    f"MARKET REGIME: {state['market_regime'].upper()}\n\n"
+                    f"Analyze patterns in wins vs losses. Which agents, indicators, or strategies "
+                    f"are working? What should change?\n"
+                    f"Respond ONLY with JSON:\n"
+                    f'{{"insights":["insight1","insight2","insight3"],'
+                    f'"agent_adjustments":{{"agent_name":0.1}},'
+                    f'"recommended_threshold":{state["conf_threshold"]},'
+                    f'"recommended_strategy":"strategy_name_or_null"}}'
+                }]
+            )
+            text  = resp.content[0].text.strip().replace("```json","").replace("```","").strip()
+            match = re.search(r'\{[\s\S]*\}', text)
+            if match:
+                reflection = json.loads(match.group())
+
+                for agent, delta in reflection.get("agent_adjustments", {}).items():
+                    if agent in state["agent_weights"]:
+                        old_w = state["agent_weights"][agent]
+                        new_w = max(0.3, min(2.5, old_w + float(delta)))
+                        state["agent_weights"][agent] = round(new_w, 3)
+                        log.info(f"  Agent {agent}: {old_w:.2f} → {new_w:.2f}")
+
+                rec_thresh = reflection.get("recommended_threshold", state["conf_threshold"])
+                new_thresh = max(state["conf_threshold"] - 5,
+                                 min(state["conf_threshold"] + 5, int(rec_thresh)))
+                if new_thresh != state["conf_threshold"]:
+                    log.info(f"  Threshold: {state['conf_threshold']}% → {new_thresh}%")
+                    state["conf_threshold"] = new_thresh
+
+                insights = reflection.get("insights", [])
+                if insights:
+                    log.info("💡 Overnight insights:")
+                    for ins in insights:
+                        log.info(f"    • {ins}")
+                    telegram("💡 Overnight insights:\n" + "\n".join(f"• {i}" for i in insights))
+
+                learned_anything = True
+        except Exception as e:
+            log.warning(f"Claude reflection failed: {e}")
+
+    # ── 3. Watchlist expansion via web search ─────────────────────────────
+    if client and state["cycle"] % 3 == 0:
+        log.info("🔍 Searching for new watchlist candidates...")
+        try:
+            resp = client.messages.create(
+                model=MODEL_OVERSEER, max_tokens=600,
+                tools=[{"type": "web_search_20250305", "name": "web_search"}],
+                messages=[{"role": "user", "content":
+                    f"Search for top momentum stocks and most active stocks today with strong "
+                    f"technical setups. Current market regime: {state['market_regime']}. "
+                    f"Current watchlist: {', '.join(WATCHLIST)}. "
+                    f"Find up to 4 additional US stocks worth adding. "
+                    f"Respond ONLY with JSON: "
+                    f'{{"candidates":[{{"symbol":"TICK","reason":"why in 8 words"}}]}}'
+                }]
+            )
+            full_text = "".join(c.text for c in resp.content if hasattr(c, "text"))
+            match = re.search(r'\{[\s\S]*?\}', full_text)
+            if match:
+                result     = json.loads(match.group())
+                candidates = result.get("candidates", [])
+                new_syms   = [c["symbol"].upper() for c in candidates
+                              if c["symbol"].upper() not in WATCHLIST][:4]
+                if new_syms:
+                    log.info(f"📋 Watchlist candidates: {', '.join(new_syms)}")
+                    telegram("📋 Watchlist candidates for review:\n" +
+                             "\n".join(f"  {c['symbol']}: {c.get('reason','')}"
+                                       for c in candidates if c["symbol"].upper() in new_syms))
+                    state["watchlist_candidates"] = new_syms
+        except Exception as e:
+            log.warning(f"Watchlist expansion failed: {e}")
+
+    # ── 4. Strategy rotation review ───────────────────────────────────────
+    tested = [s for s in state["strategies"] if s["wins"] + s["losses"] >= 3]
+    if tested:
+        best    = max(tested, key=lambda s: s["wins"] / (s["wins"] + s["losses"]))
+        current = state.get("active_strategy", {})
+        if current.get("id") != best["id"]:
+            wr_best    = best["wins"] / (best["wins"] + best["losses"]) * 100
+            wr_current = (current.get("wins", 0) /
+                          max(current.get("wins", 0) + current.get("losses", 0), 1) * 100)
+            if wr_best > wr_current + 10:
+                log.info(f"🔄 Strategy switch: {current.get('name','—')} → {best['name']} "
+                         f"({wr_current:.0f}% → {wr_best:.0f}% WR)")
+                state["active_strategy"] = best
+                telegram(f"🔄 Strategy rotated overnight:\n"
+                         f"{current.get('name','—')} ({wr_current:.0f}%) → "
+                         f"{best['name']} ({wr_best:.0f}%)")
+
+    if learned_anything:
+        save_state()
+        log.info("🌙 After-hours learning complete — state saved")
+        telegram(f"🌙 Learning complete | Regime: {state['market_regime'].upper()} | "
+                 f"Threshold: {state['conf_threshold']}% | "
+                 f"Strategy: {state.get('active_strategy',{}).get('name','—')}")
+    else:
+        log.info("🌙 After-hours learning: no new data available")
+
+
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 def main():
     log.info("═" * 55)
@@ -1275,6 +1443,7 @@ def main():
     last_regime_check = 0
     last_equity_snap  = 0
     last_stop_check   = 0
+    last_learning     = 0
     status_counter    = 0
 
     while True:
@@ -1325,6 +1494,13 @@ def main():
                 if now - last_scan >= 3600:
                     last_scan = now
                     log.info(f"Market closed ({market_time()}) — waiting for 9:30AM EST")
+
+                # After-hours learning: runs once per night around midnight
+                now_est = datetime.now(EST)
+                is_learning_window = (now_est.hour == 22 and now_est.minute < 30)
+                if is_learning_window and now - last_learning >= 20 * 3600:
+                    last_learning = now
+                    after_hours_learning()
 
             time.sleep(60)
 
