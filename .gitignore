@@ -1,0 +1,6 @@
+.env
+nexus.log
+nexus_state.json
+__pycache__/
+*.pyc
+*.pyo
